@@ -1,0 +1,1418 @@
+--[[
+	GUI Backup Tool  v2
+	Copia, guarda e restaura ScreenGuis do StarterGui (inclusive LocalScripts).
+
+	ABAS
+	  Copiar : lista as ScreenGuis do StarterGui -> marque -> "Salvar"
+	  Salvos : biblioteca de backups (com data, nº de objetos e scripts)
+	           marque -> "Restaurar"  |  lixeira = excluir (toque 2x para confirmar)
+	  Texto  : exportar backups para JSON (copiar/guardar) e importar JSON colado
+
+	MINIMIZAR
+	  Os botões "—" e "✕" do cabeçalho minimizam para um ícone flutuante.
+	  Toque no ícone para reabrir. O pequeno "×" vermelho no ícone encerra a ferramenta.
+	  (Executar o script de novo também substitui a janela antiga.)
+
+	ONDE OS BACKUPS FICAM
+	  - arquivo GuiBackupLibrary.json  (se o executor tiver writefile/readfile)
+	  - Folder "GuiBackupLibrary" no ServerStorage (Studio; fica salvo com o lugar)
+	  - e você sempre pode exportar o JSON pela aba "Texto".
+
+	LIMITAÇÕES SOBRE SCRIPTS
+	  O código-fonte só é copiado se o ambiente permitir ler LocalScript.Source
+	  (Studio/Command Bar/plugin) ou se houver decompile() no executor.
+	  Para gravar o código ao restaurar, o ambiente precisa permitir escrever Source.
+	  Se não permitir, o script é recriado vazio e o código original vai no atributo
+	  "OriginalSource" (até 100.000 caracteres) para você recuperar.
+]]
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local ServerStorage = game:GetService("ServerStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+------------------------------------------------------------------
+-- CONFIGURAÇÃO
+------------------------------------------------------------------
+local LIB_FILE = "GuiBackupLibrary.json"
+local STORE_FOLDER = "GuiBackupLibrary"
+local STORE_LIMIT = 195000 -- limite seguro de um StringValue
+local TEXTBOX_LIMIT = 190000
+local USE_EMOJI = true -- coloque false se os ícones não aparecerem no seu dispositivo
+
+local ICONS_EMOJI = {
+	app = "🗂", gui = "🖥", save = "💾", saved = "📂", text = "📋", export = "📋", import = "📥",
+	restore = "♻", trash = "🗑", all = "☑", none = "☐", min = "—", close = "✕", check = "✓",
+	empty = "📭", script = "📜",
+}
+local ICONS_ASCII = {
+	app = "GB", gui = "UI", save = "S", saved = "L", text = "T", export = ">", import = "<",
+	restore = "R", trash = "X", all = "+", none = "-", min = "-", close = "x", check = "v",
+	empty = "...", script = "#",
+}
+local ICONS = USE_EMOJI and ICONS_EMOJI or ICONS_ASCII
+
+local C = {
+	bg = Color3.fromRGB(22, 23, 34),
+	surface = Color3.fromRGB(31, 33, 48),
+	surface2 = Color3.fromRGB(40, 43, 62),
+	border = Color3.fromRGB(62, 66, 92),
+	accent = Color3.fromRGB(99, 102, 241),
+	accent2 = Color3.fromRGB(147, 92, 246),
+	green = Color3.fromRGB(34, 170, 100),
+	danger = Color3.fromRGB(225, 70, 80),
+	warn = Color3.fromRGB(235, 175, 50),
+	gray = Color3.fromRGB(62, 66, 92),
+	text = Color3.fromRGB(236, 238, 250),
+	dim = Color3.fromRGB(150, 155, 185),
+}
+
+------------------------------------------------------------------
+-- PROPRIEDADES POR TIPO
+------------------------------------------------------------------
+local function isText(i)
+	return i:IsA("TextLabel") or i:IsA("TextButton") or i:IsA("TextBox")
+end
+local function isImage(i)
+	return i:IsA("ImageLabel") or i:IsA("ImageButton")
+end
+
+local GROUPS = {
+	{ function() return true end, { "Name" } },
+	{ "GuiObject", {
+		"Active", "AnchorPoint", "AutomaticSize", "BackgroundColor3", "BackgroundTransparency",
+		"BorderColor3", "BorderMode", "BorderSizePixel", "ClipsDescendants", "LayoutOrder",
+		"Position", "Rotation", "Selectable", "Size", "SizeConstraint", "Visible", "ZIndex",
+		"AutoLocalize", "Interactable",
+	} },
+	{ "LayerCollector", { "Enabled", "ResetOnSpawn", "ZIndexBehavior", "DisplayOrder" } },
+	{ "ScreenGui", { "IgnoreGuiInset", "ScreenInsets", "ClipToDeviceSafeArea", "SafeAreaCompatibility" } },
+	{ "CanvasGroup", { "GroupColor3", "GroupTransparency" } },
+	{ "ScrollingFrame", {
+		"CanvasSize", "CanvasPosition", "AutomaticCanvasSize", "ScrollBarThickness",
+		"ScrollBarImageColor3", "ScrollBarImageTransparency", "ScrollingDirection", "ScrollingEnabled",
+		"ElasticBehavior", "HorizontalScrollBarInset", "VerticalScrollBarInset",
+		"VerticalScrollBarPosition", "BottomImage", "MidImage", "TopImage",
+	} },
+	{ isText, {
+		"Text", "TextColor3", "TextSize", "FontFace", "TextTransparency", "TextStrokeColor3",
+		"TextStrokeTransparency", "TextWrapped", "TextScaled", "TextXAlignment", "TextYAlignment",
+		"TextTruncate", "RichText", "LineHeight", "MaxVisibleGraphemes", "TextDirection",
+	} },
+	{ "GuiButton", { "AutoButtonColor", "Selected" } },
+	{ "TextBox", { "PlaceholderText", "PlaceholderColor3", "ClearTextOnFocus", "MultiLine", "ShowNativeInput", "TextEditable" } },
+	{ isImage, {
+		"Image", "ImageColor3", "ImageTransparency", "ScaleType", "SliceCenter", "SliceScale",
+		"TileSize", "ResampleMode", "ImageRectOffset", "ImageRectSize",
+	} },
+	{ "ImageButton", { "HoverImage", "PressedImage" } },
+	{ "ViewportFrame", { "Ambient", "LightColor", "LightDirection" } },
+	{ "VideoFrame", { "Video", "Looped", "Playing", "Volume" } },
+	{ "UICorner", { "CornerRadius" } },
+	{ "UIStroke", { "ApplyStrokeMode", "Color", "LineJoinMode", "Thickness", "Transparency", "Enabled" } },
+	{ "UIGradient", { "Color", "Enabled", "Offset", "Rotation", "Transparency" } },
+	{ "UIListLayout", {
+		"FillDirection", "HorizontalAlignment", "VerticalAlignment", "SortOrder", "Padding",
+		"Wraps", "HorizontalFlex", "VerticalFlex", "ItemLineAlignment",
+	} },
+	{ "UIGridLayout", {
+		"CellPadding", "CellSize", "FillDirection", "FillDirectionMaxCells", "HorizontalAlignment",
+		"VerticalAlignment", "SortOrder", "StartCorner",
+	} },
+	{ "UITableLayout", { "FillEmptySpaceColumns", "FillEmptySpaceRows", "MajorAxis", "Padding", "FillDirection", "HorizontalAlignment", "VerticalAlignment", "SortOrder" } },
+	{ "UIPageLayout", {
+		"Animated", "Circular", "EasingDirection", "EasingStyle", "GamepadInputEnabled", "Padding",
+		"ScrollWheelInputEnabled", "TouchInputEnabled", "TweenTime", "FillDirection", "SortOrder",
+		"HorizontalAlignment", "VerticalAlignment",
+	} },
+	{ "UIPadding", { "PaddingTop", "PaddingBottom", "PaddingLeft", "PaddingRight" } },
+	{ "UIScale", { "Scale" } },
+	{ "UIAspectRatioConstraint", { "AspectRatio", "AspectType", "DominantAxis" } },
+	{ "UISizeConstraint", { "MaxSize", "MinSize" } },
+	{ "UITextSizeConstraint", { "MaxTextSize", "MinTextSize" } },
+	{ "UIFlexItem", { "FlexMode", "GrowRatio", "ShrinkRatio", "ItemLineAlignment" } },
+	{ "ValueBase", { "Value" } },
+	{ "LocalScript", { "Enabled" } },
+	{ "Script", { "Enabled", "RunContext" } },
+}
+
+local function propsFor(inst)
+	local list, seen = {}, {}
+	for _, g in ipairs(GROUPS) do
+		local ok, match = pcall(function()
+			if type(g[1]) == "string" then
+				return inst:IsA(g[1])
+			end
+			return g[1](inst)
+		end)
+		if ok and match then
+			for _, p in ipairs(g[2]) do
+				if not seen[p] then
+					seen[p] = true
+					table.insert(list, p)
+				end
+			end
+		end
+	end
+	return list
+end
+
+------------------------------------------------------------------
+-- CODIFICAÇÃO / DECODIFICAÇÃO DE VALORES
+------------------------------------------------------------------
+local function enc(v)
+	local t = typeof(v)
+	if t == "boolean" or t == "string" then
+		return v
+	elseif t == "number" then
+		if v ~= v or v == math.huge or v == -math.huge then
+			return nil
+		end
+		return v
+	elseif t == "Color3" then
+		return { _t = "Color3", v = { v.R, v.G, v.B } }
+	elseif t == "UDim2" then
+		return { _t = "UDim2", v = { v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset } }
+	elseif t == "UDim" then
+		return { _t = "UDim", v = { v.Scale, v.Offset } }
+	elseif t == "Vector2" then
+		return { _t = "Vector2", v = { v.X, v.Y } }
+	elseif t == "Vector3" then
+		return { _t = "Vector3", v = { v.X, v.Y, v.Z } }
+	elseif t == "Rect" then
+		return { _t = "Rect", v = { v.Min.X, v.Min.Y, v.Max.X, v.Max.Y } }
+	elseif t == "NumberRange" then
+		return { _t = "NumberRange", v = { v.Min, v.Max } }
+	elseif t == "NumberSequence" then
+		local k = {}
+		for _, kp in ipairs(v.Keypoints) do
+			table.insert(k, { kp.Time, kp.Value, kp.Envelope })
+		end
+		return { _t = "NumberSequence", v = k }
+	elseif t == "ColorSequence" then
+		local k = {}
+		for _, kp in ipairs(v.Keypoints) do
+			table.insert(k, { kp.Time, kp.Value.R, kp.Value.G, kp.Value.B })
+		end
+		return { _t = "ColorSequence", v = k }
+	elseif t == "EnumItem" then
+		return { _t = "Enum", e = tostring(v.EnumType), n = v.Name }
+	elseif t == "Font" then
+		return { _t = "Font", f = v.Family, w = v.Weight.Name, s = v.Style.Name }
+	end
+	return nil
+end
+
+local function dec(e)
+	if type(e) ~= "table" then
+		return e
+	end
+	local t, v = e._t, e.v
+	if t == "Color3" then
+		return Color3.new(v[1], v[2], v[3])
+	elseif t == "UDim2" then
+		return UDim2.new(v[1], v[2], v[3], v[4])
+	elseif t == "UDim" then
+		return UDim.new(v[1], v[2])
+	elseif t == "Vector2" then
+		return Vector2.new(v[1], v[2])
+	elseif t == "Vector3" then
+		return Vector3.new(v[1], v[2], v[3])
+	elseif t == "Rect" then
+		return Rect.new(v[1], v[2], v[3], v[4])
+	elseif t == "NumberRange" then
+		return NumberRange.new(v[1], v[2])
+	elseif t == "NumberSequence" then
+		local k = {}
+		for _, p in ipairs(v) do
+			table.insert(k, NumberSequenceKeypoint.new(p[1], p[2], p[3] or 0))
+		end
+		return NumberSequence.new(k)
+	elseif t == "ColorSequence" then
+		local k = {}
+		for _, p in ipairs(v) do
+			table.insert(k, ColorSequenceKeypoint.new(p[1], Color3.new(p[2], p[3], p[4])))
+		end
+		return ColorSequence.new(k)
+	elseif t == "Enum" then
+		local ok, item = pcall(function()
+			return Enum[e.e][e.n]
+		end)
+		return ok and item or nil
+	elseif t == "Font" then
+		local ok, f = pcall(function()
+			return Font.new(e.f, Enum.FontWeight[e.w], Enum.FontStyle[e.s])
+		end)
+		return ok and f or nil
+	end
+	return nil
+end
+
+------------------------------------------------------------------
+-- SERIALIZAR / RECONSTRUIR
+------------------------------------------------------------------
+local defaults = {}
+local function getDefault(class)
+	if defaults[class] == nil then
+		local ok, o = pcall(Instance.new, class)
+		defaults[class] = ok and o or false
+	end
+	return defaults[class]
+end
+
+local function sameEnc(a, b)
+	return HttpService:JSONEncode({ a }) == HttpService:JSONEncode({ b })
+end
+
+-- Lê o código de um script (Source ou decompile como alternativa)
+local function readSource(inst)
+	local ok, src = pcall(function()
+		return inst.Source
+	end)
+	if ok and type(src) == "string" then
+		return src
+	end
+	if type(decompile) == "function" then
+		local ok2, r = pcall(decompile, inst)
+		if ok2 and type(r) == "string" and #r > 0 then
+			return r
+		end
+	end
+	return nil
+end
+
+local function serialize(inst)
+	local node = { c = inst.ClassName, p = {}, ch = {} }
+	local def = getDefault(inst.ClassName)
+
+	for _, prop in ipairs(propsFor(inst)) do
+		local ok, val = pcall(function()
+			return inst[prop]
+		end)
+		if ok then
+			local e = enc(val)
+			if e ~= nil then
+				local keep = (prop == "Name")
+				if not keep then
+					if def then
+						local ok2, dv = pcall(function()
+							return def[prop]
+						end)
+						if ok2 then
+							local de = enc(dv)
+							keep = not (de ~= nil and sameEnc(e, de))
+						else
+							keep = true
+						end
+					else
+						keep = true
+					end
+				end
+				if keep then
+					node.p[prop] = e
+				end
+			end
+		end
+	end
+
+	-- Código dos scripts (LocalScript, Script, ModuleScript)
+	if inst:IsA("LuaSourceContainer") then
+		local src = readSource(inst)
+		if src ~= nil then
+			if src ~= "" then
+				node.p.Source = src
+			end
+		else
+			node.nosrc = true
+		end
+	end
+
+	local okA, attrs = pcall(function()
+		return inst:GetAttributes()
+	end)
+	if okA and next(attrs) then
+		node.a = {}
+		for k, v in pairs(attrs) do
+			local e = enc(v)
+			if e ~= nil then
+				node.a[k] = e
+			end
+		end
+	end
+
+	local okT, tags = pcall(function()
+		return CollectionService:GetTags(inst)
+	end)
+	if okT and #tags > 0 then
+		node.tg = tags
+	end
+
+	if not inst:IsA("ViewportFrame") then
+		for _, child in ipairs(inst:GetChildren()) do
+			table.insert(node.ch, serialize(child))
+		end
+	end
+	return node
+end
+
+-- retorna: objetos, scripts, scripts sem código
+local function nodeStats(node)
+	local o, s, n = 1, 0, 0
+	if node.c == "LocalScript" or node.c == "Script" or node.c == "ModuleScript" then
+		s = 1
+		if node.nosrc then
+			n = 1
+		end
+	end
+	for _, c in ipairs(node.ch or {}) do
+		local a, b, d = nodeStats(c)
+		o += a
+		s += b
+		n += d
+	end
+	return o, s, n
+end
+
+local function build(node, parent, st, rootName)
+	local ok, inst = pcall(Instance.new, node.c)
+	if not ok or not inst then
+		return nil
+	end
+	for prop, val in pairs(node.p or {}) do
+		local v = dec(val)
+		if v ~= nil then
+			local okSet = pcall(function()
+				inst[prop] = v
+			end)
+			if prop == "Source" then
+				if okSet then
+					st.srcOk += 1
+				else
+					st.srcFail += 1
+					if type(v) == "string" and #v <= 100000 then
+						pcall(inst.SetAttribute, inst, "OriginalSource", v)
+					end
+				end
+			end
+		end
+	end
+	if node.nosrc then
+		st.nosrc += 1
+	end
+	for k, val in pairs(node.a or {}) do
+		local v = dec(val)
+		if v ~= nil then
+			pcall(function()
+				inst:SetAttribute(k, v)
+			end)
+		end
+	end
+	for _, tag in ipairs(node.tg or {}) do
+		pcall(function()
+			CollectionService:AddTag(inst, tag)
+		end)
+	end
+	if rootName then
+		inst.Name = rootName
+	end
+	for _, ch in ipairs(node.ch or {}) do
+		build(ch, inst, st)
+	end
+	if parent then
+		inst.Parent = parent
+	end
+	return inst
+end
+
+------------------------------------------------------------------
+-- BIBLIOTECA DE BACKUPS (persistência)
+------------------------------------------------------------------
+local hasWrite = type(writefile) == "function"
+local hasRead = type(readfile) == "function"
+
+local library = {} -- { id, name, saved, objects, scripts, nosrc, node }
+
+local function newId()
+	local ok, g = pcall(function()
+		return HttpService:GenerateGUID(false)
+	end)
+	return ok and g or (tostring(os.time()) .. tostring(math.random(1000, 9999)))
+end
+
+local function nowStr()
+	return os.date("%Y-%m-%d %H:%M:%S")
+end
+
+local function sortLibrary()
+	table.sort(library, function(a, b)
+		if a.saved ~= b.saved then
+			return a.saved > b.saved
+		end
+		return a.id > b.id
+	end)
+end
+
+local function loadLibrary()
+	library = {}
+	local seen = {}
+	local function add(e)
+		if type(e) == "table" and e.id and type(e.node) == "table" and not seen[e.id] then
+			seen[e.id] = true
+			table.insert(library, e)
+		end
+	end
+	if hasRead then
+		local okE, exists = pcall(function()
+			return type(isfile) ~= "function" or isfile(LIB_FILE)
+		end)
+		if okE and exists then
+			local ok, txt = pcall(readfile, LIB_FILE)
+			if ok and txt and #txt > 0 then
+				local ok2, data = pcall(HttpService.JSONDecode, HttpService, txt)
+				if ok2 and type(data) == "table" and type(data.entries) == "table" then
+					for _, e in ipairs(data.entries) do
+						add(e)
+					end
+				end
+			end
+		end
+	end
+	pcall(function()
+		local folder = ServerStorage:FindFirstChild(STORE_FOLDER)
+		if folder then
+			for _, sv in ipairs(folder:GetChildren()) do
+				if sv:IsA("StringValue") then
+					local ok, e = pcall(HttpService.JSONDecode, HttpService, sv.Value)
+					if ok then
+						add(e)
+					end
+				end
+			end
+		end
+	end)
+	sortLibrary()
+end
+
+-- grava a biblioteca inteira; retorna lista de locais e aviso opcional
+local function persist()
+	local where, warning = {}, nil
+	if hasWrite then
+		local ok = pcall(function()
+			writefile(LIB_FILE, HttpService:JSONEncode({ version = 2, entries = library }))
+		end)
+		if ok then
+			table.insert(where, 'arquivo "' .. LIB_FILE .. '"')
+		end
+	end
+	local okS = pcall(function()
+		local folder = ServerStorage:FindFirstChild(STORE_FOLDER)
+		if not folder then
+			folder = Instance.new("Folder")
+			folder.Name = STORE_FOLDER
+			folder.Parent = ServerStorage
+		end
+		local keep = {}
+		for _, e in ipairs(library) do
+			local json = HttpService:JSONEncode(e)
+			if #json <= STORE_LIMIT then
+				local sv = folder:FindFirstChild(e.id)
+				if not sv then
+					sv = Instance.new("StringValue")
+					sv.Name = e.id
+					sv.Parent = folder
+				end
+				sv.Value = json
+				keep[e.id] = true
+			else
+				warning = "Um backup é grande demais para o ServerStorage (ficou só no arquivo/exportação)."
+			end
+		end
+		for _, c in ipairs(folder:GetChildren()) do
+			if not keep[c.Name] then
+				c:Destroy()
+			end
+		end
+	end)
+	if okS then
+		table.insert(where, "ServerStorage." .. STORE_FOLDER)
+	end
+	return where, warning
+end
+
+local function copyToClipboard(txt)
+	local fn = (type(setclipboard) == "function" and setclipboard) or (type(toclipboard) == "function" and toclipboard)
+	if fn then
+		return (pcall(fn, txt))
+	end
+	return false
+end
+
+------------------------------------------------------------------
+-- INTERFACE: utilidades
+------------------------------------------------------------------
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local function corner(o, r)
+	return new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o)
+end
+
+local function tween(o, t, props, style, dir)
+	local tw = TweenService:Create(o, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+local conns = {}
+local function track(c)
+	table.insert(conns, c)
+	return c
+end
+
+local function makeButton(parent, cfg)
+	local base = cfg.color or C.gray
+	local b = new("TextButton", {
+		Position = cfg.pos, Size = cfg.size, BackgroundColor3 = base, AutoButtonColor = false,
+		Text = cfg.text or "", TextColor3 = C.text, Font = Enum.Font.GothamBold,
+		TextSize = cfg.textSize or 13, TextWrapped = true,
+	}, parent)
+	corner(b, cfg.radius or 10)
+	new("UIGradient", {
+		Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(200, 200, 212)), Rotation = 90,
+	}, b)
+	local sc = new("UIScale", {}, b)
+	local hover = base:Lerp(Color3.new(1, 1, 1), 0.14)
+	b.MouseEnter:Connect(function()
+		tween(b, 0.12, { BackgroundColor3 = hover })
+	end)
+	b.MouseLeave:Connect(function()
+		tween(b, 0.12, { BackgroundColor3 = base })
+		tween(sc, 0.1, { Scale = 1 })
+	end)
+	b.MouseButton1Down:Connect(function()
+		tween(sc, 0.08, { Scale = 0.95 })
+	end)
+	b.MouseButton1Up:Connect(function()
+		tween(sc, 0.14, { Scale = 1 }, Enum.EasingStyle.Back)
+	end)
+	if cfg.callback then
+		b.Activated:Connect(cfg.callback)
+	end
+	return b
+end
+
+local function makeDraggable(handle, target, onClick)
+	local dragging, moved, startInput, startPos = false, false, nil, nil
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			startInput = input.Position
+			startPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if not moved and onClick then
+						onClick()
+					end
+				end
+			end)
+		end
+	end)
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - startInput
+			if d.Magnitude > 6 then
+				moved = true
+			end
+			if moved then
+				target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			end
+		end
+	end))
+end
+
+------------------------------------------------------------------
+-- INTERFACE: janela principal
+------------------------------------------------------------------
+local screen = Instance.new("ScreenGui")
+screen.Name = "GuiBackupTool"
+screen.ResetOnSpawn = false
+screen.DisplayOrder = 999999
+screen.IgnoreGuiInset = true
+screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local function cleanOld(container)
+	pcall(function()
+		for _, c in ipairs(container:GetChildren()) do
+			if c.Name == "GuiBackupTool" then
+				c:Destroy()
+			end
+		end
+	end)
+end
+
+local parented = false
+if type(gethui) == "function" then
+	pcall(function()
+		local h = gethui()
+		cleanOld(h)
+		screen.Parent = h
+		parented = screen.Parent ~= nil
+	end)
+end
+if not parented then
+	pcall(function()
+		local cg = game:GetService("CoreGui")
+		cleanOld(cg)
+		screen.Parent = cg
+		parented = screen.Parent ~= nil
+	end)
+end
+if not parented then
+	local lp = Players.LocalPlayer
+	if lp then
+		local pg = lp:WaitForChild("PlayerGui")
+		cleanOld(pg)
+		screen.Parent = pg
+	end
+end
+
+screen.Destroying:Connect(function()
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+end)
+
+local function screenSize()
+	local s = screen.AbsoluteSize
+	if s.X < 10 or s.Y < 10 then
+		local cam = workspace.CurrentCamera
+		s = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	end
+	return s
+end
+
+local W, H = 480, 520
+local function fitScale()
+	local s = screenSize()
+	return math.clamp(math.min((s.X - 24) / W, (s.Y - 24) / H), 0.5, 1)
+end
+
+local root = new("Frame", {
+	Name = "Root", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(W, H), BackgroundTransparency = 1,
+}, screen)
+local rootScale = new("UIScale", { Scale = 0.85 * fitScale() }, root)
+
+local main = new("CanvasGroup", {
+	Name = "Main", Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.bg, BorderSizePixel = 0,
+	GroupTransparency = 1,
+}, root)
+corner(main, 16)
+new("UIGradient", {
+	Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(215, 215, 235)), Rotation = 90,
+}, main)
+local frameLine = new("Frame", {
+	Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 1, -2), BackgroundTransparency = 1, ZIndex = 5,
+}, main)
+corner(frameLine, 15)
+new("UIStroke", { Color = C.border, Thickness = 1, Transparency = 0.2 }, frameLine)
+
+-- Cabeçalho
+local header = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.accent, BorderSizePixel = 0, Active = true,
+}, main)
+new("UIGradient", {
+	Color = ColorSequence.new(C.accent, C.accent2), Rotation = 0,
+}, header)
+new("TextLabel", {
+	Position = UDim2.fromOffset(14, 0), Size = UDim2.fromOffset(32, 46), BackgroundTransparency = 1,
+	Text = ICONS.app, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 22,
+}, header)
+new("TextLabel", {
+	Position = UDim2.fromOffset(50, 5), Size = UDim2.new(1, -140, 0, 22), BackgroundTransparency = 1,
+	Text = "GUI Backup Tool", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 16,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+new("TextLabel", {
+	Position = UDim2.fromOffset(50, 25), Size = UDim2.new(1, -140, 0, 16), BackgroundTransparency = 1,
+	Text = "Copie, guarde e restaure suas interfaces", TextColor3 = Color3.fromRGB(225, 225, 255),
+	Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+
+local minimize, expand, quit -- definidas adiante
+
+makeButton(header, {
+	pos = UDim2.new(1, -78, 0, 8), size = UDim2.fromOffset(30, 30), color = Color3.fromRGB(255, 255, 255),
+	text = ICONS.min, radius = 8, callback = function() minimize() end,
+}).BackgroundTransparency = 0.8
+makeButton(header, {
+	pos = UDim2.new(1, -42, 0, 8), size = UDim2.fromOffset(30, 30), color = C.danger,
+	text = ICONS.close, radius = 8, callback = function() minimize() end,
+})
+
+-- Barra de status
+local statusBar = new("Frame", {
+	Position = UDim2.fromOffset(12, 452), Size = UDim2.fromOffset(456, 58), BackgroundColor3 = C.surface,
+}, main)
+corner(statusBar, 10)
+local dot = new("Frame", {
+	AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(8, 8),
+	BackgroundColor3 = C.dim,
+}, statusBar)
+corner(dot, 4)
+local statusText = new("TextLabel", {
+	Position = UDim2.fromOffset(28, 4), Size = UDim2.new(1, -38, 1, -8), BackgroundTransparency = 1,
+	Text = "Pronto.", TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+}, statusBar)
+
+local KIND = { info = C.accent, ok = C.green, warn = C.warn, err = C.danger }
+local function setStatus(msg, kind)
+	statusText.Text = msg
+	statusText.TextTransparency = 1
+	tween(statusText, 0.25, { TextTransparency = 0 })
+	local col = KIND[kind or "info"]
+	tween(dot, 0.25, { BackgroundColor3 = col })
+end
+
+-- Abas
+local tabBar = new("Frame", {
+	Position = UDim2.fromOffset(12, 54), Size = UDim2.fromOffset(456, 36), BackgroundColor3 = C.surface,
+}, main)
+corner(tabBar, 10)
+local pill = new("Frame", {
+	Position = UDim2.new(0, 3, 0, 4), Size = UDim2.new(1 / 3, -6, 1, -8), BackgroundColor3 = C.accent,
+}, tabBar)
+corner(pill, 8)
+new("UIGradient", { Color = ColorSequence.new(C.accent, C.accent2), Rotation = 0 }, pill)
+
+local tabNames = {
+	ICONS.save .. "  Copiar",
+	ICONS.saved .. "  Salvos",
+	ICONS.text .. "  Texto",
+}
+local tabs, pages = {}, {}
+local currentTab = 1
+
+local function newPage()
+	return new("CanvasGroup", {
+		Position = UDim2.fromOffset(0, 98), Size = UDim2.fromOffset(480, 340), BackgroundTransparency = 1,
+		Visible = false, GroupTransparency = 1,
+	}, main)
+end
+pages[1], pages[2], pages[3] = newPage(), newPage(), newPage()
+
+local function showPage(i)
+	currentTab = i
+	tween(pill, 0.25, { Position = UDim2.new((i - 1) / 3, 3, 0, 4) }, Enum.EasingStyle.Quint)
+	for idx, p in ipairs(pages) do
+		tabs[idx].TextColor3 = (idx == i) and C.text or C.dim
+		if idx == i then
+			p.Visible = true
+			p.GroupTransparency = 1
+			tween(p, 0.22, { GroupTransparency = 0 })
+		else
+			p.Visible = false
+		end
+	end
+end
+
+for i = 1, 3 do
+	tabs[i] = new("TextButton", {
+		Position = UDim2.new((i - 1) / 3, 0, 0, 0), Size = UDim2.new(1 / 3, 0, 1, 0), BackgroundTransparency = 1,
+		Text = tabNames[i], TextColor3 = C.dim, Font = Enum.Font.GothamBold, TextSize = 13, ZIndex = 2,
+	}, tabBar)
+	tabs[i].Activated:Connect(function()
+		showPage(i)
+	end)
+end
+
+------------------------------------------------------------------
+-- INTERFACE: lista com caixas de seleção
+------------------------------------------------------------------
+local function makeList(parent, opts)
+	local scroll = new("ScrollingFrame", {
+		Position = UDim2.fromOffset(12, 0), Size = UDim2.fromOffset(456, 270), BackgroundColor3 = C.surface,
+		BorderSizePixel = 0, ScrollBarThickness = 4, ScrollBarImageColor3 = C.accent,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	}, parent)
+	corner(scroll, 12)
+	new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, scroll)
+	new("UIPadding", {
+		PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 10),
+		PaddingBottom = UDim.new(0, 6),
+	}, scroll)
+
+	local list = { items = {}, rows = {} }
+
+	function list:set(items)
+		local prev = {}
+		for _, it in ipairs(self.items) do
+			prev[it.id] = it.selected
+		end
+		for _, r in ipairs(self.rows) do
+			r:Destroy()
+		end
+		self.rows, self.items = {}, items
+
+		if #items == 0 then
+			local empty = new("Frame", { Size = UDim2.new(1, 0, 0, 200), BackgroundTransparency = 1 }, scroll)
+			new("TextLabel", {
+				Position = UDim2.fromOffset(0, 50), Size = UDim2.new(1, 0, 0, 50), BackgroundTransparency = 1,
+				Text = ICONS.empty, TextColor3 = C.dim, Font = Enum.Font.GothamBold, TextSize = 36,
+			}, empty)
+			new("TextLabel", {
+				Position = UDim2.fromOffset(0, 104), Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1,
+				Text = opts.emptyText or "Nada por aqui.", TextColor3 = C.dim, Font = Enum.Font.Gotham,
+				TextSize = 13, TextWrapped = true,
+			}, empty)
+			table.insert(self.rows, empty)
+			return
+		end
+
+		for i, it in ipairs(items) do
+			if prev[it.id] ~= nil then
+				it.selected = prev[it.id]
+			else
+				it.selected = false
+			end
+
+			local row = new("TextButton", {
+				Size = UDim2.new(1, 0, 0, 52), BackgroundColor3 = C.surface2, BackgroundTransparency = 1,
+				Text = "", AutoButtonColor = false, LayoutOrder = i,
+			}, scroll)
+			corner(row, 10)
+			local rs = new("UIStroke", { Color = C.accent, Thickness = 1.5, Transparency = 1 }, row)
+
+			local box = new("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0),
+				Size = UDim2.fromOffset(22, 22), BackgroundColor3 = C.gray,
+			}, row)
+			corner(box, 6)
+			local mark = new("TextLabel", {
+				Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", TextColor3 = C.text,
+				Font = Enum.Font.GothamBold, TextSize = 15,
+			}, box)
+
+			new("TextLabel", {
+				Position = UDim2.fromOffset(42, 0), Size = UDim2.fromOffset(26, 52), BackgroundTransparency = 1,
+				Text = ICONS.gui, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 18,
+			}, row)
+
+			local rightMargin = opts.deletable and 56 or 14
+			new("TextLabel", {
+				Position = UDim2.fromOffset(74, 8), Size = UDim2.new(1, -(74 + rightMargin), 0, 18),
+				BackgroundTransparency = 1, Text = it.name, TextColor3 = C.text, Font = Enum.Font.GothamBold,
+				TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+			}, row)
+			new("TextLabel", {
+				Position = UDim2.fromOffset(74, 27), Size = UDim2.new(1, -(74 + rightMargin), 0, 16),
+				BackgroundTransparency = 1, Text = it.sub, TextColor3 = C.dim, Font = Enum.Font.Gotham,
+				TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+			}, row)
+
+			local function paint(animated)
+				local t = animated and 0.15 or 0
+				tween(box, t, { BackgroundColor3 = it.selected and C.accent or C.gray })
+				tween(rs, t, { Transparency = it.selected and 0 or 1 })
+				mark.Text = it.selected and ICONS.check or ""
+			end
+			it._paint = paint
+			paint(false)
+
+			row.MouseEnter:Connect(function()
+				tween(row, 0.12, { BackgroundColor3 = C.surface2:Lerp(Color3.new(1, 1, 1), 0.06) })
+			end)
+			row.MouseLeave:Connect(function()
+				tween(row, 0.12, { BackgroundColor3 = C.surface2 })
+			end)
+			row.Activated:Connect(function()
+				it.selected = not it.selected
+				paint(true)
+			end)
+
+			if opts.deletable then
+				local del = new("TextButton", {
+					AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0),
+					Size = UDim2.fromOffset(34, 34), BackgroundColor3 = C.surface, AutoButtonColor = false,
+					Text = ICONS.trash, TextColor3 = C.dim, Font = Enum.Font.GothamBold, TextSize = 16,
+				}, row)
+				corner(del, 9)
+				local armed = false
+				del.Activated:Connect(function()
+					if not armed then
+						armed = true
+						del.Text = "?"
+						tween(del, 0.15, { BackgroundColor3 = C.danger })
+						tween(del, 0.15, { TextColor3 = C.text })
+						if opts.onArm then
+							opts.onArm(it)
+						end
+						task.delay(2.5, function()
+							if armed and del.Parent then
+								armed = false
+								del.Text = ICONS.trash
+								tween(del, 0.15, { BackgroundColor3 = C.surface })
+								tween(del, 0.15, { TextColor3 = C.dim })
+							end
+						end)
+					else
+						armed = false
+						if opts.onDelete then
+							opts.onDelete(it)
+						end
+					end
+				end)
+			end
+
+			-- entrada suave
+			task.delay(math.min(i, 10) * 0.03, function()
+				if row.Parent then
+					tween(row, 0.25, { BackgroundTransparency = 0 })
+				end
+			end)
+			table.insert(self.rows, row)
+		end
+	end
+
+	function list:setAll(state)
+		for _, it in ipairs(self.items) do
+			it.selected = state
+			if it._paint then
+				it._paint(true)
+			end
+		end
+	end
+
+	function list:getSelected()
+		local out = {}
+		for _, it in ipairs(self.items) do
+			if it.selected then
+				table.insert(out, it)
+			end
+		end
+		return out
+	end
+
+	return list
+end
+
+------------------------------------------------------------------
+-- LÓGICA: Abas Copiar e Salvos
+------------------------------------------------------------------
+local listCopy, listSaved
+
+local function describe(objects, scripts, nosrc)
+	local s = objects .. " objetos"
+	if scripts > 0 then
+		s ..= "  •  " .. scripts .. (scripts == 1 and " script" or " scripts")
+		if nosrc and nosrc > 0 then
+			s ..= " (" .. nosrc .. " sem código)"
+		end
+	end
+	return s
+end
+
+local function refreshCopy()
+	local items = {}
+	for _, g in ipairs(StarterGui:GetChildren()) do
+		if g:IsA("ScreenGui") then
+			local desc = g:GetDescendants()
+			local scripts = 0
+			for _, d in ipairs(desc) do
+				if d:IsA("LuaSourceContainer") then
+					scripts += 1
+				end
+			end
+			table.insert(items, {
+				id = "gui_" .. g.Name .. "_" .. tostring(#items + 1),
+				name = g.Name,
+				sub = describe(#desc + 1, scripts),
+				data = g,
+			})
+		end
+	end
+	listCopy:set(items)
+	if #items == 0 then
+		setStatus("Nenhuma ScreenGui encontrada no StarterGui.", "warn")
+	end
+	return #items
+end
+
+local function refreshSaved()
+	local items = {}
+	for _, e in ipairs(library) do
+		table.insert(items, {
+			id = e.id,
+			name = e.name,
+			sub = e.saved .. "  •  " .. describe(e.objects or 0, e.scripts or 0, e.nosrc or 0),
+			data = e,
+		})
+	end
+	listSaved:set(items)
+	tabs[2].Text = ICONS.saved .. "  Salvos" .. (#library > 0 and (" (" .. #library .. ")") or "")
+end
+
+-- Página 1: Copiar
+listCopy = makeList(pages[1], {
+	emptyText = "Nenhuma ScreenGui no StarterGui deste jogo.",
+})
+makeButton(pages[1], {
+	pos = UDim2.fromOffset(12, 280), size = UDim2.fromOffset(100, 40), color = C.gray,
+	text = ICONS.all .. " Tudo", callback = function() listCopy:setAll(true) end,
+})
+makeButton(pages[1], {
+	pos = UDim2.fromOffset(120, 280), size = UDim2.fromOffset(100, 40), color = C.gray,
+	text = ICONS.none .. " Nenhum", callback = function() listCopy:setAll(false) end,
+})
+makeButton(pages[1], {
+	pos = UDim2.fromOffset(228, 280), size = UDim2.fromOffset(240, 40), color = C.green,
+	text = ICONS.save .. "  Copiar e salvar", callback = function()
+		local sel = listCopy:getSelected()
+		if #sel == 0 then
+			setStatus("Selecione pelo menos uma ScreenGui.", "err")
+			return
+		end
+		local okAll, err = pcall(function()
+			local totalO, totalS, totalN = 0, 0, 0
+			for _, it in ipairs(sel) do
+				local node = serialize(it.data)
+				local o, s, n = nodeStats(node)
+				totalO += o
+				totalS += s
+				totalN += n
+				table.insert(library, {
+					id = newId(), name = it.name, saved = nowStr(),
+					objects = o, scripts = s, nosrc = n, node = node,
+				})
+			end
+			sortLibrary()
+			local where, warning = persist()
+			refreshSaved()
+			local msg = ("%d ScreenGui(s) salva(s) • %d objetos • %d scripts."):format(#sel, totalO, totalS)
+			local kind = "ok"
+			if totalN > 0 then
+				msg ..= (" ⚠ %d script(s) sem código legível neste ambiente."):format(totalN)
+				kind = "warn"
+			end
+			if #where > 0 then
+				msg ..= " Salvo em: " .. table.concat(where, " e ") .. "."
+			else
+				msg ..= " Sem armazenamento persistente: use a aba Texto para exportar o JSON."
+				kind = "warn"
+			end
+			if warning then
+				msg ..= " " .. warning
+				kind = "warn"
+			end
+			setStatus(msg, kind)
+			listCopy:setAll(false)
+		end)
+		if not okAll then
+			setStatus("Erro ao criar backup: " .. tostring(err), "err")
+		end
+	end,
+})
+
+-- Restauração
+local function uniqueName(base)
+	local name, n = base, 1
+	while StarterGui:FindFirstChild(name) do
+		n += 1
+		name = base .. "_Restaurada" .. (n > 2 and tostring(n - 1) or "")
+	end
+	return name
+end
+
+local function restoreEntries(entries)
+	local created, failed = 0, 0
+	local st = { srcOk = 0, srcFail = 0, nosrc = 0 }
+	for _, e in ipairs(entries) do
+		local name = uniqueName((e.node.p and e.node.p.Name) or e.name or e.node.c)
+		local ok, inst = pcall(build, e.node, StarterGui, st, name)
+		if ok and inst then
+			created += 1
+			local lp = Players.LocalPlayer
+			if lp and RunService:IsRunning() then
+				pcall(function()
+					inst:Clone().Parent = lp:WaitForChild("PlayerGui")
+				end)
+			end
+		else
+			failed += 1
+		end
+	end
+	local msg = ("%d ScreenGui(s) restaurada(s) no StarterGui"):format(created)
+	local kind = "ok"
+	if st.srcOk > 0 then
+		msg ..= (" • %d script(s) com código"):format(st.srcOk)
+	end
+	if st.srcFail > 0 then
+		msg ..= (" • ⚠ %d script(s) sem poder gravar o código (guardado no atributo OriginalSource)"):format(st.srcFail)
+		kind = "warn"
+	end
+	if st.nosrc > 0 then
+		msg ..= (" • ⚠ %d script(s) já estavam sem código no backup"):format(st.nosrc)
+		kind = "warn"
+	end
+	if failed > 0 then
+		msg ..= (" • %d falharam"):format(failed)
+		kind = "err"
+	end
+	setStatus(msg .. ".", kind)
+	refreshCopy()
+end
+
+-- Página 2: Salvos
+listSaved = makeList(pages[2], {
+	deletable = true,
+	emptyText = "Nenhum backup salvo ainda.\nUse a aba Copiar para criar o primeiro.",
+	onArm = function(it)
+		setStatus('Toque novamente na lixeira para excluir "' .. it.name .. '".', "warn")
+	end,
+	onDelete = function(it)
+		for i, e in ipairs(library) do
+			if e.id == it.id then
+				table.remove(library, i)
+				break
+			end
+		end
+		persist()
+		refreshSaved()
+		setStatus('Backup "' .. it.name .. '" excluído.', "ok")
+	end,
+})
+makeButton(pages[2], {
+	pos = UDim2.fromOffset(12, 280), size = UDim2.fromOffset(100, 40), color = C.gray,
+	text = ICONS.all .. " Tudo", callback = function() listSaved:setAll(true) end,
+})
+makeButton(pages[2], {
+	pos = UDim2.fromOffset(120, 280), size = UDim2.fromOffset(100, 40), color = C.gray,
+	text = ICONS.none .. " Nenhum", callback = function() listSaved:setAll(false) end,
+})
+makeButton(pages[2], {
+	pos = UDim2.fromOffset(228, 280), size = UDim2.fromOffset(240, 40), color = C.accent,
+	text = ICONS.restore .. "  Restaurar selecionadas", callback = function()
+		local sel = listSaved:getSelected()
+		if #sel == 0 then
+			setStatus("Selecione pelo menos um backup para restaurar.", "err")
+			return
+		end
+		local entries = {}
+		for _, it in ipairs(sel) do
+			table.insert(entries, it.data)
+		end
+		local ok, err = pcall(restoreEntries, entries)
+		if not ok then
+			setStatus("Erro ao restaurar: " .. tostring(err), "err")
+		end
+	end,
+})
+
+------------------------------------------------------------------
+-- Página 3: Texto (exportar / importar JSON)
+------------------------------------------------------------------
+local box = new("TextBox", {
+	Position = UDim2.fromOffset(12, 0), Size = UDim2.fromOffset(456, 270), BackgroundColor3 = C.surface,
+	Text = "", PlaceholderText = "Exportar: o JSON dos backups aparece aqui.\nImportar: cole aqui um JSON exportado antes.",
+	TextColor3 = C.text, PlaceholderColor3 = C.dim, Font = Enum.Font.Code, TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+	ClearTextOnFocus = false, MultiLine = true, TextWrapped = true, ClipsDescendants = true,
+}, pages[3])
+corner(box, 12)
+new("UIPadding", {
+	PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 8), PaddingRight = UDim.new(0, 10),
+}, box)
+
+makeButton(pages[3], {
+	pos = UDim2.fromOffset(12, 280), size = UDim2.fromOffset(224, 40), color = C.gray,
+	text = ICONS.export .. "  Exportar (selecionados ou todos)", callback = function()
+		local entries = {}
+		for _, it in ipairs(listSaved:getSelected()) do
+			table.insert(entries, it.data)
+		end
+		if #entries == 0 then
+			entries = library
+		end
+		if #entries == 0 then
+			setStatus("Não há backups para exportar.", "err")
+			return
+		end
+		local ok, json = pcall(HttpService.JSONEncode, HttpService, { version = 2, entries = entries })
+		if not ok then
+			setStatus("Falha ao gerar o JSON: " .. tostring(json), "err")
+			return
+		end
+		local copied = copyToClipboard(json)
+		if #json <= TEXTBOX_LIMIT then
+			box.Text = json
+		else
+			box.Text = "[JSON grande demais para exibir (" .. #json .. " caracteres).]"
+		end
+		setStatus(("%d backup(s) exportado(s) (%d caracteres)%s."):format(#entries, #json, copied and " e copiado(s) para a área de transferência" or ""), (#json <= TEXTBOX_LIMIT or copied) and "ok" or "warn")
+	end,
+})
+makeButton(pages[3], {
+	pos = UDim2.fromOffset(244, 280), size = UDim2.fromOffset(224, 40), color = C.accent,
+	text = ICONS.import .. "  Importar texto colado", callback = function()
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, box.Text)
+		if not ok or type(data) ~= "table" then
+			setStatus("Texto inválido. Cole o JSON completo exportado pela ferramenta.", "err")
+			return
+		end
+		local incoming = {}
+		if type(data.entries) == "table" then
+			incoming = data.entries
+		elseif type(data.guis) == "table" then -- formato da versão 1
+			for _, g in ipairs(data.guis) do
+				table.insert(incoming, { id = newId(), name = (g.p and g.p.Name) or g.c, saved = data.created or nowStr(), node = g })
+			end
+		else
+			setStatus("Formato de backup não reconhecido.", "err")
+			return
+		end
+		local ids = {}
+		for _, e in ipairs(library) do
+			ids[e.id] = true
+		end
+		local added = 0
+		for _, e in ipairs(incoming) do
+			if type(e) == "table" and type(e.node) == "table" then
+				e.id = e.id or newId()
+				if not ids[e.id] then
+					ids[e.id] = true
+					e.name = e.name or e.node.c
+					e.saved = e.saved or nowStr()
+					local o, s, n = nodeStats(e.node)
+					e.objects, e.scripts, e.nosrc = o, s, n
+					table.insert(library, e)
+					added += 1
+				end
+			end
+		end
+		sortLibrary()
+		persist()
+		refreshSaved()
+		setStatus(added > 0 and (added .. " backup(s) importado(s). Veja na aba Salvos.") or "Nada novo para importar (já existiam).", added > 0 and "ok" or "warn")
+		if added > 0 then
+			box.Text = ""
+			showPage(2)
+		end
+	end,
+})
+
+------------------------------------------------------------------
+-- Ícone flutuante, minimizar / expandir
+------------------------------------------------------------------
+local icon = new("Frame", {
+	Name = "FloatingIcon", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, -44, 0.5, 0),
+	Size = UDim2.fromOffset(56, 56), BackgroundColor3 = C.accent, Visible = false, Active = true,
+}, screen)
+corner(icon, 28)
+new("UIGradient", { Color = ColorSequence.new(C.accent, C.accent2), Rotation = 45 }, icon)
+new("UIStroke", { Color = Color3.fromRGB(255, 255, 255), Thickness = 2, Transparency = 0.6 }, icon)
+local iconScale = new("UIScale", { Scale = 0 }, icon)
+new("TextLabel", {
+	Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = ICONS.app, TextColor3 = C.text,
+	Font = Enum.Font.GothamBold, TextSize = 26,
+}, icon)
+local iconQuit = new("TextButton", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, -6, 0, 6), Size = UDim2.fromOffset(20, 20),
+	BackgroundColor3 = C.danger, Text = ICONS.close, TextColor3 = C.text, Font = Enum.Font.GothamBold,
+	TextSize = 10, AutoButtonColor = false, ZIndex = 3,
+}, icon)
+corner(iconQuit, 10)
+
+local state = { minimized = false, busy = false, lastPos = root.Position }
+
+local function iconCenter()
+	local size = screenSize()
+	local p = icon.Position
+	return UDim2.fromOffset(p.X.Scale * size.X + p.X.Offset, p.Y.Scale * size.Y + p.Y.Offset)
+end
+
+function minimize()
+	if state.minimized or state.busy then
+		return
+	end
+	state.busy = true
+	state.lastPos = root.Position
+	local target = iconCenter()
+	tween(rootScale, 0.28, { Scale = 0.1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	tween(root, 0.28, { Position = target }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	tween(main, 0.26, { GroupTransparency = 1 })
+	task.delay(0.3, function()
+		root.Visible = false
+		icon.Visible = true
+		iconScale.Scale = 0
+		tween(iconScale, 0.35, { Scale = 1 }, Enum.EasingStyle.Back)
+		state.minimized = true
+		state.busy = false
+	end)
+end
+
+function expand()
+	if not state.minimized or state.busy then
+		return
+	end
+	state.busy = true
+	root.Position = iconCenter()
+	rootScale.Scale = 0.1
+	main.GroupTransparency = 1
+	root.Visible = true
+	tween(iconScale, 0.18, { Scale = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	task.delay(0.18, function()
+		icon.Visible = false
+	end)
+	tween(rootScale, 0.38, { Scale = fitScale() }, Enum.EasingStyle.Back)
+	tween(root, 0.38, { Position = state.lastPos }, Enum.EasingStyle.Quint)
+	tween(main, 0.3, { GroupTransparency = 0 })
+	task.delay(0.4, function()
+		state.minimized = false
+		state.busy = false
+	end)
+end
+
+function quit()
+	tween(iconScale, 0.2, { Scale = 0 }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+	task.delay(0.22, function()
+		screen:Destroy()
+	end)
+end
+iconQuit.Activated:Connect(function()
+	quit()
+end)
+
+makeDraggable(header, root)
+makeDraggable(icon, icon, function()
+	expand()
+end)
+
+------------------------------------------------------------------
+-- INÍCIO
+------------------------------------------------------------------
+loadLibrary()
+refreshSaved()
+local found = refreshCopy()
+showPage(1)
+
+if found > 0 then
+	setStatus(("%d ScreenGui(s) encontrada(s). Marque as que deseja copiar. %d backup(s) salvo(s)."):format(found, #library), "info")
+end
+
+-- animação de abertura
+tween(rootScale, 0.45, { Scale = fitScale() }, Enum.EasingStyle.Back)
+tween(main, 0.35, { GroupTransparency = 0 })
