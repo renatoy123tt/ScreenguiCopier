@@ -16,6 +16,13 @@ local player = Players.LocalPlayer
 local userId = player and player.UserId or 0
 local guiParent = (pcall(function() return CoreGui.Name end) and CoreGui) or player:WaitForChild("PlayerGui")
 
+-- remove janelas de execuções anteriores (evita ficar com uma versão antiga na tela)
+for _, old in ipairs(guiParent:GetChildren()) do
+    if old.Name == "MapBackupMobileSystem" then
+        pcall(function() old:Destroy() end)
+    end
+end
+
 local hasFileAPI = type(writefile) == "function" and type(readfile) == "function"
     and type(listfiles) == "function" and type(makefolder) == "function"
     and type(isfolder) == "function" and type(delfile) == "function"
@@ -1138,7 +1145,7 @@ local function loadBackupList()
             itemFrame.Parent = BackupScroll
 
             local selectBtn = Instance.new("TextButton")
-            selectBtn.Size = UDim2.new(1, -70, 1, 0)
+            selectBtn.Size = UDim2.new(1, -78, 1, 0)
             selectBtn.BackgroundColor3 = Theme.Surface2
             selectBtn.BorderSizePixel = 0
             selectBtn.Font = Enum.Font.Gotham
@@ -1152,14 +1159,15 @@ local function loadBackupList()
 
             -- Botão: recolocar partes nas posições originais
             local resetBtn = Instance.new("TextButton")
-            resetBtn.Size = UDim2.new(0, 30, 1, 0)
-            resetBtn.Position = UDim2.new(1, -66, 0, 0)
+            resetBtn.Size = UDim2.new(0, 40, 1, 0)
+            resetBtn.Position = UDim2.new(1, -74, 0, 0)
             resetBtn.BackgroundColor3 = Theme.Success
             resetBtn.BorderSizePixel = 0
             resetBtn.Font = Enum.Font.GothamBold
-            resetBtn.Text = "📍"
+            resetBtn.Text = "POS"
             resetBtn.TextColor3 = Theme.Text
-            resetBtn.TextSize = 12
+            resetBtn.TextSize = 11
+            resetBtn.ZIndex = 2
             resetBtn.Parent = itemFrame
             corner(resetBtn, 7)
 
